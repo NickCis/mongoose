@@ -176,6 +176,10 @@ typedef void *SSL;
 typedef void *SSL_CTX;
 #endif
 
+#ifdef NS_ENABLE_ZLIB
+#include <zlib.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -243,6 +247,12 @@ struct ns_connection {
   struct iobuf send_iobuf;    // Data scheduled for sending
   SSL *ssl;
   SSL_CTX *ssl_ctx;
+
+#ifdef NS_ENABLE_ZLIB
+  int using_zlib;
+  z_stream strm;
+#endif
+
   void *user_data;            // User-specific data
   void *proto_data;           // Application protocol-specific data
   time_t last_io_time;        // Timestamp of the last socket IO
@@ -339,6 +349,7 @@ int ns_resolve(const char *domain_name, char *ip_addr_buf, size_t buf_len);
 #define NS_READ_BUFFER_SIZE         2048
 #define NS_UDP_RECEIVE_BUFFER_SIZE  2000
 #define NS_VPRINTF_BUFFER_SIZE      500
+#define NS_COMPRESS_BUFFER_SIZE     2048
 
 struct ctl_msg {
   ns_callback_t callback;
@@ -553,6 +564,11 @@ static void ns_destroy_conn(struct ns_connection *conn) {
   }
   if (conn->ssl_ctx != NULL) {
     SSL_CTX_free(conn->ssl_ctx);
+  }
+#endif
+#ifdef NS_ENABLE_ZLIB
+  if (conn->using_zlib) {
+    deflateEnd(&conn->strm);
   }
 #endif
   NS_FREE(conn);
@@ -1948,13 +1964,36 @@ static void send_http_error(struct connection *conn, int code,
   close_local_endpoint(conn);  // This will write to the log file
 }
 
-static void write_chunk(struct connection *conn, const char *buf, int len) {
+static void _write_chunk(struct connection *conn, const char *buf, int len) {
   char chunk_size[50];
   int n = mg_snprintf(chunk_size, sizeof(chunk_size), "%X\r\n", len);
   ns_send(conn->ns_conn, chunk_size, n);
   ns_send(conn->ns_conn, buf, len);
   ns_send(conn->ns_conn, "\r\n", 2);
 }
+
+#ifdef NS_ENABLE_ZLIB
+static void write_chunk(struct connection *conn, const char *buf, int len) {
+  unsigned char chunk[NS_COMPRESS_BUFFER_SIZE];
+
+  if(conn->ns_conn->using_zlib) {
+      conn->ns_conn->strm.next_in = (unsigned char*) buf;
+      conn->ns_conn->strm.avail_in = len;
+      do {
+          conn->ns_conn->strm.avail_out = sizeof(chunk);
+          conn->ns_conn->strm.next_out = chunk;
+          deflate(&conn->ns_conn->strm, Z_FINISH);
+          _write_chunk(conn, (const char*) chunk, sizeof(chunk) - conn->ns_conn->strm.avail_out);
+      } while(conn->ns_conn->strm.avail_out == 0);
+
+      return;
+  }
+
+  _write_chunk(conn, buf, len);
+}
+#else
+#define write_chunk(...) _write_chunk(__VA_ARGS__)
+#endif
 
 size_t mg_printf(struct mg_connection *conn, const char *fmt, ...) {
   va_list ap;
@@ -2799,6 +2838,18 @@ static void terminate_headers(struct mg_connection *c) {
   struct connection *conn = MG_CONN_2_CONN(c);
   if (!(conn->ns_conn->flags & MG_HEADERS_SENT)) {
     mg_send_header(c, "Transfer-Encoding", "chunked");
+#ifdef NS_ENABLE_ZLIB
+    // TODO: check if gzip/deflate are allowed
+    conn->ns_conn->using_zlib = 1;
+    conn->ns_conn->strm.zalloc = NULL;
+    conn->ns_conn->strm.zfree = NULL;
+    conn->ns_conn->strm.opaque = NULL;
+    // gzip:
+    deflateInit2(&conn->ns_conn->strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 | 16, 8, Z_DEFAULT_STRATEGY);
+    // deflate:
+    // deflateInit2(&conn->ns_conn->strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8, Z_DEFAULT_STRATEGY);
+    mg_send_header(c, "Content-Encoding", "gzip");
+#endif
     mg_write(c, "\r\n", 2);
     conn->ns_conn->flags |= MG_HEADERS_SENT;
   }
